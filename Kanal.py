@@ -35,7 +35,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8628291859:AAGqvsXf46KZAb397R62uKbdi68X6QKsPY0")
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://mergenowlyagulyyew41_db_user:ZvZhOKOAF6ZMRbHX@cluster1.l8z8gll.mongodb.net/?appName=Cluster1")  # <-- MongoDB
 DB_NAME = os.getenv("DB_NAME", "marzban_bot")
-RENDER_URL = os.getenv("RENDER_URL", "https://vpn-paylayan-bot-zonex-2z3p.onrender.com")  # <-- Flask / Render URL
+RENDER_URL = os.getenv("RENDER_URL", "https://vn-goyuan.onrender.com")  # <-- Flask / Render URL
 PORT = int(os.getenv("PORT", "10000"))
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Ashgabat")
 VERIFY_SSL = False  # self-signed sertifika icin False; gercek sertifika varsa True
