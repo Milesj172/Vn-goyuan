@@ -32,7 +32,7 @@ from flask import Flask
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # ============================ AYARLAR ============================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8628291859:AAEXKzyTkoJuBh9jkNoaXRp7O6Vk-zaS4JU")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8628291859:AAGU2nCGtUugngNH4lKDQqWcELCkBwXmzcU")
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://mergenowlyagulyyew41_db_user:ZvZhOKOAF6ZMRbHX@cluster1.l8z8gll.mongodb.net/?appName=Cluster1")  # <-- MongoDB
 DB_NAME = os.getenv("DB_NAME", "marzban_bot")
 RENDER_URL = os.getenv("RENDER_URL", "https://vn-goyuan.onrender.com")  # <-- Flask / Render URL
