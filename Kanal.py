@@ -1,0 +1,1331 @@
+import asyncio
+import base64
+import json
+import logging
+import os
+import random
+import re
+import string
+import threading
+import uuid
+from datetime import datetime
+from html import escape, unescape
+from urllib.parse import quote, urlparse
+from zoneinfo import ZoneInfo
+
+import aiohttp
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    ChatMemberUpdated,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LinkPreviewOptions,
+    Message,
+)
+from flask import Flask
+from motor.motor_asyncio import AsyncIOMotorClient
+
+# ============================ AYARLAR ============================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8628291859:AAFSgvdGGrxfBBEVSpp_CnDth-lpy9zUyLw")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://mergenowlyagulyyew41_db_user:ZvZhOKOAF6ZMRbHX@cluster1.l8z8gll.mongodb.net/?appName=Cluster1")  # <-- MongoDB
+DB_NAME = os.getenv("DB_NAME", "marzban_bot")
+RENDER_URL = os.getenv("RENDER_URL", "https://vn-goyuan.onrender.com")  # <-- Flask / Render URL
+PORT = int(os.getenv("PORT", "10000"))
+TIMEZONE = os.getenv("TIMEZONE", "Asia/Ashgabat")
+VERIFY_SSL = False  # self-signed sertifika icin False; gercek sertifika varsa True
+DEFAULT_LANG = "tr"  # "tr" veya "tk"
+FOOTER_MAX = 1000
+LINK_NAME_MAX = 60  # VPN link adi (uygulamada gorunen isim) en fazla
+MEDIA_TEXT_MAX = 900  # fotonun alt yazisi (caption) icin en fazla gorunen karakter
+CAPTION_MAX = 1000  # Telegram medya yazisi limiti 1024; kucuk pay birakildi
+TEXT_MAX = 3800  # duz mesaj icin (limit 4096)
+MAX_TIMES = 12  # gunde en fazla kac saat
+PANEL_RETRIES = 4  # panel hata verirse hemen kac kez denesin
+RETRY_DELAYS = (5, 15, 30)  # denemeler arasi bekleme (sn)
+LATE_RETRIES = 6  # hepsi basarisiz olursa arka planda kac kez daha denesin
+LATE_RETRY_MIN = 5  # arka plan denemeleri arasi (dakika)
+DEFAULT_SHARE_MODE = "links"  # links = config linkleri, sub = abonelik linki, both = ikisi
+# =================================================================
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("marzban_bot")
+
+db = AsyncIOMotorClient(MONGO_URI)[DB_NAME]
+router = Router()
+router.message.filter(F.chat.type == "private")
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+
+# ============================ DIL (TR / TK) =======================
+LANGS = {"tr": "🇹🇷 Türkçe", "tk": "🇹🇲 Türkmençe"}
+
+S = {
+    "tr": {
+        "menu_title": "Merhaba! Ne yapmak istersin?",
+        "b_addp": "🔗 Marzban ekle",
+        "b_delp": "🗑 Marzban sil",
+        "b_send": "🚀 VPN linki dağıt",
+        "b_time": "⏰ Saat ayarla",
+        "b_footer": "✏️ Post metni",
+        "b_media": "🖼 Foto / medya",
+        "b_media_on": "🖼 Foto / medya ✅",
+        "b_addch": "➕ Kanal ekle",
+        "b_chs": "📋 Kanallarım",
+        "b_quote_on": "📦 Alıntı: daraltılmış ✅",
+        "b_quote_off": "📦 Alıntı: açık",
+        "b_lang": "🌐 Dil",
+        "b_mode": "📤 Paylaşım: {m}",
+        "mode_links": "Config linkleri",
+        "mode_sub": "Sub linki",
+        "mode_both": "Sub + Config",
+        "mode_msg": "📤 Paylaşım türü: {m}",
+        "b_connect": "🔗 Marzban panel bağla",
+        "ask_url": "Panel URL'sini yaz (örnek: http://1.2.3.4:8000)",
+        "panel_addr": "Panel adresi: <code>{url}</code>\nKullanıcı adını yaz:",
+        "ask_pass": "Parolayı yaz:",
+        "ok_panel": "✅ Doğrulama başarılı! Panel eklendi.",
+        "fail_panel": "❌ {err}\nTekrar denemek için /menu",
+        "no_panel": "❌ Önce Marzban paneli ekle.",
+        "no_channels": "❌ Kanal yok. Önce kanal ekle.",
+        "sent": "✅ VPN linkleri {ok}/{total} kanala gönderildi.",
+        "errs_title": "⚠️ Hatalar:",
+        "time_cur": "Şu anki saatler: <b>{cur}</b> ({tz})\nHer gün VPN linki konacak saati yaz (örnek: 12:00)\nBirden fazla için virgülle ayır: <code>6:00,12:00,20:00</code>\nKapatmak için: <code>kapat</code>",
+        "not_set": "ayarlanmadı",
+        "time_bad": "Format yanlış. Örnek: 12:00 veya 6:00,12:00,20:00",
+        "time_set": "✅ Her gün <b>{t}</b> saatinde VPN linki kanallara konacak.",
+        "time_off": "⏰ Otomatik gönderim kapatıldı.",
+        "ask_chat": "Kanal @username veya ID yaz (bot o kanalda admin olmalı).\nBotu kanala admin yaparsan otomatik de eklenir.",
+        "ch_added": "✅ <b>{title}</b> eklendi.",
+        "bot_not_admin": "Bot bu kanalda admin değil.",
+        "you_not_admin": "Sen bu kanalın admini değilsin.",
+        "ch_none": "Henüz kanal yok.",
+        "ch_list": "📋 Kanallar:",
+        "admin_done": "✅ Bot <b>{title}</b> kanalında admin yapıldı.",
+        "footer_ask": "Alıntının altına konacak metni yaz.\nTelegram'da biçimlendirebilirsin (kalın, italik, link vb.), aynen korunur.\nSilmek için: <code>sil</code>",
+        "footer_cur": "\n\nŞu anki metin:\n{cur}",
+        "footer_saved": "✅ Metin kaydedildi. Görünüm:",
+        "footer_cleared": "✅ Metin silindi.",
+        "footer_bad": "❌ Metin geçersiz: {err}",
+        "footer_long": "❌ Metin çok uzun (en fazla {n} karakter).",
+        "footer_text_only": "Sadece metin gönder.",
+        "media_ask": "Foto, video, GIF veya dosya gönder.\nİstersen altına yazı (caption) da yaz: yazı medyanın hemen altında görünür. Yazmazsan sadece medya gider.\nPost tek mesaj olarak gider: medya + yazı + VPN linkleri + \"Post metni\" (Telegram medya yazısı 1024 karakterle sınırlı; sığmayan kısım ikinci mesaja geçer).\nSilmek için: <code>sil</code>",
+        "media_cur": "\n\n📎 Şu anki medya: {kind}",
+        "media_cur_text": "\nYazı:\n{cur}",
+        "media_saved": "✅ Medya kaydedildi. Görünüm:",
+        "media_cleared": "✅ Medya silindi.",
+        "media_only": "Foto, video, GIF veya dosya gönder.",
+        "b_lname": "🏷 Link adı",
+        "b_lname_on": "🏷 Link adı ✅",
+        "lname_ask": "VPN linklerinin adını yaz (uygulamada görünen isim).\nÖrnek: <code>VIP Server</code>\nHer linkte panelin oluşturduğu kullanıcı adı da görünsün istersen: <code>VIP {{user}}</code>\nVarsayılana dönmek için: <code>sil</code>",
+        "lname_cur": "\n\n🏷 Şu anki ad: <code>{cur}</code>",
+        "lname_saved": "✅ Link adı kaydedildi: <code>{cur}</code>",
+        "lname_cleared": "✅ Link adı sıfırlandı (panelin verdiği ad kullanılır).",
+        "lname_long": "Ad en fazla {n} karakter olabilir.",
+        "lname_only": "Sadece yazı gönder.",
+        "m_photo": "🖼 Foto",
+        "m_video": "🎬 Video",
+        "m_animation": "🎞 GIF",
+        "m_document": "📄 Dosya",
+        "del_which": "Hangi paneli silmek istiyorsun?",
+        "del_none": "Panel yok.",
+        "del_done": "🗑 Panel silindi: {url}",
+        "quote_on_msg": "📦 Linkler daraltılmış alıntı içinde gidecek.",
+        "quote_off_msg": "📦 Linkler açık alıntı içinde gidecek.",
+        "lang_pick": "Dil seç:",
+        "lang_set": "✅ Dil değiştirildi.",
+        "err_login": "Kullanıcı adı veya parola yanlış.",
+        "err_unexpected": "Panel beklenen cevabı vermedi (HTTP {status}). URL'yi kontrol et: {url}",
+        "err_conn": "Panele bağlanılamadı: {err}",
+        "err_inbounds": "Panelden inbound listesi alınamadı.",
+        "err_create": "User oluşturulamadı ({status}): {err}",
+        "err_nolinks": "Panel VPN linki döndürmedi.{info}",
+        "err_nosub": "Panel abonelik (sub) linki döndürmedi.",
+        "retry_info": "🔁 Panel cevap vermedi. {min} dakikada bir otomatik tekrar denenecek (en fazla {n} kez).",
+        "late_ok": "✅ Tekrar deneme başarılı: {url} linkleri {ok}/{total} kanala gönderildi.",
+        "late_fail": "❌ Tekrar denemeler bitti, {url} paneline ulaşılamadı. Paneli kontrol et.",
+    },
+    "tk": {
+        "menu_title": "Salam! Näme etmek isleýärsiň?",
+        "b_addp": "🔗 Marzban goş",
+        "b_delp": "🗑 Marzban poz",
+        "b_send": "🚀 VPN link paýla",
+        "b_time": "⏰ Wagt sazla",
+        "b_footer": "✏️ Post teksti",
+        "b_media": "🖼 Surat / media",
+        "b_media_on": "🖼 Surat / media ✅",
+        "b_addch": "➕ Kanal goş",
+        "b_chs": "📋 Kanallarym",
+        "b_quote_on": "📦 Sitata: ýygnalan ✅",
+        "b_quote_off": "📦 Sitata: açyk",
+        "b_lang": "🌐 Dil",
+        "b_mode": "📤 Paýlaşyş: {m}",
+        "mode_links": "Config linkler",
+        "mode_sub": "Sub link",
+        "mode_both": "Sub + Config",
+        "mode_msg": "📤 Paýlaşyş görnüşi: {m}",
+        "b_connect": "🔗 Marzban paneli birikdir",
+        "ask_url": "Panel URL-ni ýaz (mysal: http://1.2.3.4:8000)",
+        "panel_addr": "Panel salgysy: <code>{url}</code>\nUlanyjy adyňy ýaz:",
+        "ask_pass": "Paroly ýaz:",
+        "ok_panel": "✅ Barlag üstünlikli! Panel goşuldy.",
+        "fail_panel": "❌ {err}\nÝene synanyşmak üçin /menu",
+        "no_panel": "❌ Ilki Marzban paneli goş.",
+        "no_channels": "❌ Kanal ýok. Ilki kanal goş.",
+        "sent": "✅ VPN linkler {ok}/{total} kanala iberildi.",
+        "errs_title": "⚠️ Näsazlyklar:",
+        "time_cur": "Häzirki wagtlar: <b>{cur}</b> ({tz})\nHer gün VPN link goýuljak wagty ýaz (mysal: 12:00)\nBirnäçe bolsa otur bilen aýyr: <code>6:00,12:00,20:00</code>\nÖçürmek üçin: <code>ýap</code>",
+        "not_set": "sazlanmady",
+        "time_bad": "Format ýalňyş. Mysal: 12:00 ýa-da 6:00,12:00,20:00",
+        "time_set": "✅ Her gün <b>{t}</b> wagtynda VPN link kanallara goýular.",
+        "time_off": "⏰ Awtomatik ibermek öçürildi.",
+        "ask_chat": "Kanalyň @username ýa-da ID-sini ýaz (bot şol kanalda admin bolmaly).\nBotu kanala admin etseň, awtomatik hem goşular.",
+        "ch_added": "✅ <b>{title}</b> goşuldy.",
+        "bot_not_admin": "Bot bu kanalda admin däl.",
+        "you_not_admin": "Sen bu kanalyň admini däl.",
+        "ch_none": "Heniz kanal ýok.",
+        "ch_list": "📋 Kanallar:",
+        "admin_done": "✅ Bot <b>{title}</b> kanalynda admin edildi.",
+        "footer_ask": "Sitatanyň aşagyna goýuljak teksti ýaz.\nTelegramda formatlap bilersiň (galyň, ýapgyt, link we ş.m.), şol bolşy ýaly saklanar.\nÖçürmek üçin: <code>poz</code>",
+        "footer_cur": "\n\nHäzirki tekst:\n{cur}",
+        "footer_saved": "✅ Tekst saklandy. Görnüşi:",
+        "footer_cleared": "✅ Tekst öçürildi.",
+        "footer_bad": "❌ Tekst nädogry: {err}",
+        "footer_long": "❌ Tekst gaty uzyn (iň köp {n} simwol).",
+        "footer_text_only": "Diňe tekst iber.",
+        "media_ask": "Surat, wideo, GIF ýa-da faýl iber.\nIsteseň aşagyna ýazgy (caption) hem ýaz: ýazgy mediýanyň aşagynda görünýär. Ýazmasaň diňe media gidýär.\nPost bir habar bolup gidýär: media + ýazgy + VPN linkler + \"Post teksti\" (Telegram media ýazgysy 1024 simwol bilen çäklendirilen; sygmadyk bölegi ikinji habara geçýär).\nÖçürmek üçin: <code>poz</code>",
+        "media_cur": "\n\n📎 Häzirki media: {kind}",
+        "media_cur_text": "\nÝazgy:\n{cur}",
+        "media_saved": "✅ Media saklandy. Görnüşi:",
+        "media_cleared": "✅ Media öçürildi.",
+        "media_only": "Surat, wideo, GIF ýa-da faýl iber.",
+        "b_lname": "🏷 Link ady",
+        "b_lname_on": "🏷 Link ady ✅",
+        "lname_ask": "VPN linkleriň adyny ýaz (programmada görünýän at).\nMysal: <code>VIP Server</code>\nHer linkde panelde döredilen ulanyjy ady hem görünsin diýseň: <code>VIP {{user}}</code>\nBaşlangyç ada dolanmak üçin: <code>poz</code>",
+        "lname_cur": "\n\n🏷 Häzirki at: <code>{cur}</code>",
+        "lname_saved": "✅ Link ady saklandy: <code>{cur}</code>",
+        "lname_cleared": "✅ Link ady arassalandy (panel bereni ulanylýar).",
+        "lname_long": "At iň köp {n} simwol bolup biler.",
+        "lname_only": "Diňe tekst iber.",
+        "m_photo": "🖼 Surat",
+        "m_video": "🎬 Wideo",
+        "m_animation": "🎞 GIF",
+        "m_document": "📄 Faýl",
+        "del_which": "Haýsy paneli pozmaly?",
+        "del_none": "Panel ýok.",
+        "del_done": "🗑 Panel pozuldy: {url}",
+        "quote_on_msg": "📦 Linkler ýygnalan sitatanyň içinde iberiler.",
+        "quote_off_msg": "📦 Linkler açyk sitatanyň içinde iberiler.",
+        "lang_pick": "Dil saýla:",
+        "lang_set": "✅ Dil üýtgedildi.",
+        "err_login": "Ulanyjy ady ýa-da parol ýalňyş.",
+        "err_unexpected": "Panel garaşylýan jogaby bermedi (HTTP {status}). URL-ni barla: {url}",
+        "err_conn": "Panele birikip bolmady: {err}",
+        "err_inbounds": "Panelden inbound sanawy alyp bolmady.",
+        "err_create": "User döredip bolmady ({status}): {err}",
+        "err_nolinks": "Panel VPN link bermedi.{info}",
+        "err_nosub": "Panel abunalyk (sub) link bermedi.",
+        "retry_info": "🔁 Panel jogap bermedi. Her {min} minutdan awtomatik ýene synanyşylar (iň köp {n} gezek).",
+        "late_ok": "✅ Gaýtadan synanyşyk üstünlikli: {url} linkler {ok}/{total} kanala iberildi.",
+        "late_fail": "❌ Gaýtadan synanyşyklar gutardy, {url} paneline ýetip bolmady. Paneli barla.",
+    },
+}
+
+
+def t(L: str, key: str, **kw) -> str:
+    return S.get(L, S[DEFAULT_LANG])[key].format(**kw)
+
+
+# ------------------------- Flask (Render) ------------------------
+app = Flask(__name__)
+
+
+@app.route("/")
+def home():
+    return "Bot calisiyor"
+
+
+def run_flask():
+    app.run(host="0.0.0.0", port=PORT)
+
+
+async def keep_alive():
+    if "SENIN-APP" in RENDER_URL or not RENDER_URL:
+        return
+    while True:
+        await asyncio.sleep(600)
+        try:
+            async with aiohttp.ClientSession() as s:
+                await s.get(RENDER_URL, timeout=aiohttp.ClientTimeout(total=15))
+        except Exception as e:
+            log.warning("keep_alive hata: %s", e)
+
+
+# ----------------------------- DB helpers ------------------------
+def new_id() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+async def get_owner(uid: int) -> dict:
+    o = await db.owners.find_one({"_id": uid}) or {"_id": uid}
+    if o.get("panel") and not o.get("panels"):  # eski tek-panel kaydini tasi
+        p = dict(o["panel"])
+        p["id"] = new_id()
+        p["current_user"] = o.get("current_user")
+        await db.owners.update_one(
+            {"_id": uid},
+            {"$set": {"panels": [p]}, "$unset": {"panel": "", "current_user": ""}},
+        )
+        o["panels"] = [p]
+        o.pop("panel", None)
+        o.pop("current_user", None)
+    if o.get("time") and not o.get("times"):  # eski tek saat kaydini tasi
+        t0 = o["time"]
+        upd = {"times": [t0]}
+        if o.get("last_run"):
+            upd["done"] = {"date": o["last_run"], "times": [t0]}
+        await db.owners.update_one({"_id": uid}, {"$set": upd, "$unset": {"time": "", "last_run": ""}})
+        o.update(upd)
+        o.pop("time", None)
+        o.pop("last_run", None)
+    o.setdefault("panels", [])
+    return o
+
+
+async def get_lang(uid: int) -> str:
+    o = await db.owners.find_one({"_id": uid}, {"lang": 1})
+    return (o or {}).get("lang", DEFAULT_LANG)
+
+
+# --------------------------- Marzban API -------------------------
+class PanelError(Exception):
+    def __init__(self, key: str, transient: bool = False, **kw):
+        self.key, self.transient, self.kw = key, transient, kw
+        super().__init__(key)
+
+    def text(self, L: str) -> str:
+        return t(L, self.key, **self.kw)
+
+
+# gecici sayilan HTTP kodlari (panel yeniden basliyor / proxy 502 vs.) -> tekrar denenir
+TRANSIENT_STATUS = {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+
+
+def err_text(e: Exception) -> str:
+    return escape(str(e) or type(e).__name__)
+
+
+async def api(panel: dict, method: str, path: str, token: str | None = None, **kw):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    connector = aiohttp.TCPConnector(ssl=VERIFY_SSL)
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=30), connector=connector
+    ) as s:
+        async with s.request(method, panel["url"] + path, headers=headers, **kw) as r:
+            try:
+                data = await r.json(content_type=None)
+            except Exception:
+                data = None
+            return r.status, data
+
+
+async def panel_login(panel: dict) -> str:
+    try:
+        status, data = await api(
+            panel,
+            "POST",
+            "/api/admin/token",
+            data={"username": panel["username"], "password": panel["password"]},
+        )
+    except Exception as e:
+        raise PanelError("err_conn", transient=True, err=err_text(e))
+    if status in (401, 403):
+        raise PanelError("err_login")
+    if status != 200 or not data or "access_token" not in data:
+        raise PanelError(
+            "err_unexpected",
+            transient=status in TRANSIENT_STATUS or status >= 500,
+            status=status,
+            url=escape(panel["url"]),
+        )
+    return data["access_token"]
+
+
+def rand_username() -> str:
+    return "vpn_" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+
+
+async def delete_user(panel: dict, token: str, name: str) -> bool:
+    """Panelden user sil. Basarili (veya zaten yok) ise True."""
+    try:
+        status, _ = await api(panel, "DELETE", f"/api/user/{name}", token)
+    except Exception as e:
+        log.warning("user silinemedi (%s): %s", name, e)
+        return False
+    return status in (200, 204, 404)
+
+
+LINK_RE = re.compile(r"^[a-z][a-z0-9+.\-]*://\S+$", re.I)
+SUB_UA = "v2rayN/6.45"  # abonelik adresi bu UA ile ham link listesi doner (tarayici UA'si HTML sayfa verir)
+
+
+def parse_links(text: str) -> list[str]:
+    """Duz metin ya da base64 abonelik icerigindeki vless://, vmess:// ... satirlarini ayikla."""
+    text = (text or "").strip()
+
+    def grab(x: str) -> list[str]:
+        return [ln.strip() for ln in x.splitlines() if LINK_RE.match(ln.strip())]
+
+    got = grab(text)
+    if got:
+        return got
+    try:
+        raw = re.sub(r"\s+", "", text).replace("-", "+").replace("_", "/")
+        raw += "=" * (-len(raw) % 4)
+        return grab(base64.b64decode(raw).decode("utf-8", "ignore"))
+    except Exception:
+        return []
+
+
+async def fetch_sub_links(sub_url: str) -> list[str]:
+    """Panel create cevabinda links bos geldiyse linkleri abonelik adresinden oku (PasarGuard)."""
+    base = sub_url.rstrip("/")
+    for u in (sub_url, base + "/links", base + "/v2ray", base + "/links_base64"):
+        try:
+            connector = aiohttp.TCPConnector(ssl=VERIFY_SSL)
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30), connector=connector
+            ) as sess:
+                async with sess.get(u, headers={"User-Agent": SUB_UA}) as r:
+                    if r.status != 200:
+                        continue
+                    found = parse_links(await r.text())
+                    if found:
+                        return found
+        except Exception as e:
+            log.warning("abonelik okunamadi (%s): %s", u, e)
+    return []
+
+
+async def rotate_user(uid: int, panel: dict, username: str) -> dict:
+    """Yeni user kur, eski useri sil. {"links": [...], "sub": "https://..."} dondur."""
+    token = await panel_login(panel)
+
+    status, inbounds = await api(panel, "GET", "/api/inbounds", token)
+    if status != 200 or not inbounds:
+        raise PanelError("err_inbounds", transient=True)
+
+    if isinstance(inbounds, dict):  # Marzban: {proto: [{tag,...}]}
+        body = {
+            "username": username,
+            "proxies": {proto: {} for proto in inbounds},
+            "inbounds": {proto: [i["tag"] for i in items] for proto, items in inbounds.items()},
+            "expire": 0,
+            "data_limit": 0,
+            "status": "active",
+        }
+    else:  # PasarGuard: inbound listesi liste doner, kullanici group_ids ile kurulur
+        gstatus, gdata = await api(panel, "GET", "/api/groups", token)
+        groups = gdata.get("groups") if isinstance(gdata, dict) else gdata
+        gids = [g["id"] for g in (groups or []) if isinstance(g, dict) and "id" in g]
+        if gstatus != 200 or not gids:
+            raise PanelError("err_inbounds", transient=True)
+        body = {
+            "username": username,
+            "group_ids": gids,
+            "expire": 0,
+            "data_limit": 0,
+            "status": "active",
+        }
+
+    status, data = await api(panel, "POST", "/api/user", token, json=body)
+    if status == 409:  # onceki deneme useri kurmus ama cevap kaybolmus -> mevcut useri al
+        status, data = await api(panel, "GET", f"/api/user/{username}", token)
+    if status not in (200, 201) or not data:
+        raise PanelError(
+            "err_create",
+            transient=status in TRANSIENT_STATUS or status >= 500,
+            status=status,
+            err=escape(str(data)[:200]),
+        )
+
+    links = data.get("links") or []
+    sub = data.get("subscription_url") or ""
+    if not links or not sub:  # create cevabi bos olabilir -> kullaniciyi tekrar oku
+        st2, d2 = await api(panel, "GET", f"/api/user/{username}", token)
+        if st2 == 200 and isinstance(d2, dict):
+            links = links or d2.get("links") or []
+            sub = sub or d2.get("subscription_url") or ""
+    if sub and not sub.startswith("http"):  # goreli yol geldiyse panel adresini onune koy
+        sub = panel["url"] + (sub if sub.startswith("/") else "/" + sub)
+    from_sub = False
+    if not links and sub:  # hala bos -> linkleri abonelik adresinden al
+        links = await fetch_sub_links(sub)
+        from_sub = bool(links)
+    debug = f"\n(links: {len(links)}, sub: {'var' if sub else 'yok'}{', abonelikten' if from_sub else ''})"
+
+    # Yeni user hazir -> eski(ler)i temizle. Silinemeyen user "stale_users" listesinde
+    # kalir ve bir sonraki dagitimda tekrar silinmeye calisilir.
+    old = panel.get("current_user")
+    targets = [x for x in dict.fromkeys(([old] if old else []) + list(panel.get("stale_users") or [])) if x != username]
+    still = []
+    for name in targets:
+        if not await delete_user(panel, token, name):
+            still.append(name)
+    await db.owners.update_one(
+        {"_id": uid, "panels.id": panel["id"]},
+        {"$set": {"panels.$.current_user": username, "panels.$.stale_users": still}},
+    )
+    panel["current_user"], panel["stale_users"] = username, still
+    return {"links": links, "sub": sub, "debug": debug, "user": username}
+
+
+async def rotate_with_retry(uid: int, panel: dict, attempts: int = PANEL_RETRIES) -> dict:
+    """Gecici hatalarda (502, baglanti koptu, timeout...) bekleyip tekrar dener."""
+    username = rand_username()  # tum denemelerde ayni -> cift user olusmaz
+    last: PanelError | None = None
+    for n in range(1, attempts + 1):
+        try:
+            return await rotate_user(uid, panel, username)
+        except PanelError as e:
+            if not e.transient:
+                raise
+            last = e
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            last = PanelError("err_conn", transient=True, err=err_text(e))
+        log.warning("panel %s deneme %s/%s basarisiz: %s", panel["url"], n, attempts, last.kw)
+        if n < attempts:
+            await asyncio.sleep(RETRY_DELAYS[min(n - 1, len(RETRY_DELAYS) - 1)])
+    raise last
+
+
+def rename_link(link: str, name: str) -> str:
+    """Link adini (uygulamada gorunen remark) degistir: vless/trojan/ss/hysteria '#ad', vmess base64 icindeki 'ps'."""
+    if link.lower().startswith("vmess://"):
+        try:
+            raw = link[8:].strip()
+            j = json.loads(base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8"))
+            j["ps"] = name
+            return "vmess://" + base64.b64encode(json.dumps(j, ensure_ascii=False).encode("utf-8")).decode()
+        except Exception:
+            return link
+    return link.split("#", 1)[0] + "#" + quote(name, safe="")
+
+
+def rename_links(links: list[str], name: str | None, user: str = "") -> list[str]:
+    """name bos ise panelin verdigi ad kalir. {user} -> panelde olusan kullanici adi. Birden fazla link varsa 2., 3. ... numaralanir."""
+    if not name:
+        return links
+    out = []
+    for i, ln in enumerate(links, 1):
+        nm = name.replace("{user}", user)
+        if i > 1:
+            nm += f" {i}"
+        out.append(rename_link(ln, nm))
+    return out
+
+
+def pick_items(res: dict, mode: str) -> tuple[list[str], list[str]]:
+    """Paylasim turune gore (sub_linkleri, config_linkleri) dondur."""
+    subs = [res["sub"]] if res.get("sub") else []
+    links = res.get("links") or []
+    if mode == "sub":
+        links = []
+        if not subs:
+            raise PanelError("err_nosub")
+    elif mode == "both":
+        if not subs and not links:
+            raise PanelError("err_nolinks", info=res.get("debug", ""))
+    else:
+        subs = []
+        if not links:
+            raise PanelError("err_nolinks", info=res.get("debug", ""))
+    return subs, links
+
+
+# ------------------------ Post olusturma -------------------------
+def u16(s: str) -> int:
+    """Telegram uzunlugu UTF-16 birimiyle sayar (emoji = 2)."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def vlen(html: str) -> int:
+    """HTML metnin Telegram'in sayacagi gorunen uzunlugu (etiketsiz, unescape'li)."""
+    return u16(unescape(re.sub(r"<[^>]+>", "", html)))
+
+
+def build_media_post(
+    sections: list[list[str]], footer: str, expandable: bool, media: dict, media_text: str
+) -> list[str | dict]:
+    """Tek post: medya + (istege bagli foto yazisi) + VPN linkleri (kopyalanabilir alinti) + Post metni.
+    Hepsi medyanin caption'ina sigiyorsa TEK mesaj gider. Sigmazsa fazlasi sonraki duz mesajlara tasar."""
+    open_tag = "<blockquote expandable>" if expandable else "<blockquote>"
+    head_len = vlen(media_text) + (2 if media_text else 0)  # yazi + bosluk satiri
+    msgs = [{"limit": max(CAPTION_MAX - head_len, 0), "blocks": [], "used": 0, "footer": ""}]
+    for items in sections:
+        new_block = True
+        for link in items:
+            n = u16(link)
+            while True:
+                cur = msgs[-1]
+                add = n + (1 if cur["blocks"] else 0)  # satir/blok arasi \n
+                # bos duz mesaja cok uzun tek link bile olsa zorla koy (sonsuz dongu olmasin)
+                if cur["used"] + add <= cur["limit"] or (not cur["blocks"] and len(msgs) > 1):
+                    break
+                msgs.append({"limit": TEXT_MAX, "blocks": [], "used": 0, "footer": ""})
+                new_block = True
+            cur = msgs[-1]
+            if new_block:
+                cur["blocks"].append([])
+                new_block = False
+            cur["blocks"][-1].append(link)
+            cur["used"] += add
+    if footer:
+        fl = vlen(footer)
+        cur = msgs[-1]
+        add = fl + (2 if cur["blocks"] else 0)
+        if cur["used"] + add > cur["limit"]:  # footer caption'a sigmadi -> sonraki mesaja
+            msgs.append({"limit": TEXT_MAX, "blocks": [], "used": 0, "footer": ""})
+            cur = msgs[-1]
+        cur["footer"] = footer
+
+    out = []
+    for i, m in enumerate(msgs):
+        parts = []
+        if i == 0 and media_text:
+            parts.append(media_text)
+        if m["blocks"]:
+            parts.append(
+                "\n".join(
+                    f"{open_tag}<code>" + "\n".join(escape(x) for x in b) + "</code></blockquote>"
+                    for b in m["blocks"]
+                )
+            )
+        if m["footer"]:
+            parts.append(m["footer"])
+        out.append("\n\n".join(parts))
+    return [{"type": media["type"], "file_id": media["file_id"], "caption": out[0]}] + out[1:]
+
+
+def build_messages(
+    sections: list[list[str]], footer: str, expandable: bool, media: dict | None = None, media_text: str = ""
+) -> list[str | dict]:
+    """Her bolum (sub / config) kendi <code> blogunda, her satirda bir link, aralarinda bosluk yok.
+    Dokununca hepsi birden kopyalanir. Alintinin altina footer metni gelir (son mesajda)."""
+    if media:
+        return build_media_post(sections, footer, expandable, media, media_text)
+    open_tag = "<blockquote expandable>" if expandable else "<blockquote>"
+    limit = 3800 - len(footer)
+    chunks = []
+    for items in sections:
+        cur, size = [], 0
+        for link in items:
+            esc = escape(link)
+            if cur and size + len(esc) + 1 > limit:
+                chunks.append(cur)
+                cur, size = [], 0
+            cur.append(esc)
+            size += len(esc) + 1
+        if cur:
+            chunks.append(cur)
+
+    msgs = []
+    for i, ch in enumerate(chunks):
+        text = f"{open_tag}<code>" + "\n".join(ch) + "</code></blockquote>"
+        if footer and i == len(chunks) - 1:
+            text += "\n\n" + footer
+        msgs.append(text)
+    return msgs
+
+
+def extract_media(m: Message) -> dict | None:
+    """Mesajdaki foto / video / GIF / dosyayi {"type", "file_id"} olarak dondur."""
+    if m.photo:
+        return {"type": "photo", "file_id": m.photo[-1].file_id}  # en buyuk boyut
+    if m.video:
+        return {"type": "video", "file_id": m.video.file_id}
+    if m.animation:  # GIF'te document de dolu geldigi icin documentten ONCE kontrol edilmeli
+        return {"type": "animation", "file_id": m.animation.file_id}
+    if m.document:
+        return {"type": "document", "file_id": m.document.file_id}
+    return None
+
+
+async def _send_once(bot: Bot, chat_id: int, item: str | dict):
+    if isinstance(item, dict):  # medya
+        kind = item["type"]
+        sender = getattr(bot, f"send_{kind}")  # send_photo / send_video / send_animation / send_document
+        await sender(chat_id, **{kind: item["file_id"]}, caption=item.get("caption") or None)
+    else:  # duz metin
+        await bot.send_message(chat_id, item, link_preview_options=NO_PREVIEW)
+
+
+async def safe_send(bot: Bot, chat_id: int, item: str | dict):
+    """Flood limiti / ag hatasinda bekleyip tekrar dener. item: metin (str) veya medya (dict)."""
+    for n in range(3):
+        try:
+            await _send_once(bot, chat_id, item)
+            return
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except TelegramNetworkError:
+            await asyncio.sleep(3 * (n + 1))
+    await _send_once(bot, chat_id, item)  # son deneme, hata verirse yukari
+
+
+async def send_to_channels(bot: Bot, channels: list[dict], msgs: list[str | dict]) -> tuple[int, list[str]]:
+    ok, fail = 0, []
+    for ch in channels:
+        name = escape(ch.get("title") or str(ch["_id"]))
+        try:
+            for m in msgs:
+                try:
+                    await safe_send(bot, ch["_id"], m)
+                except Exception as e:
+                    if not isinstance(m, dict):
+                        raise
+                    # medya gitmedi: linkler caption icinde oldugu icin yazisini duz mesaj olarak gonder
+                    fail.append(f"{name} (medya): {escape(str(e))}")
+                    if m.get("caption"):
+                        await safe_send(bot, ch["_id"], m["caption"])
+            ok += 1
+        except Exception as e:
+            fail.append(f"{name}: {escape(str(e))}")
+        await asyncio.sleep(0.5)
+    return ok, fail
+
+
+# ---------------- Basarisiz panel icin gec tekrar deneme ---------
+late_tasks: dict[tuple[int, str], asyncio.Task] = {}
+
+
+def cancel_late(uid: int, pid: str):
+    task = late_tasks.pop((uid, pid), None)
+    if task and not task.done() and task is not asyncio.current_task():
+        task.cancel()
+
+
+def start_late(bot: Bot, uid: int, pid: str):
+    cancel_late(uid, pid)
+    late_tasks[(uid, pid)] = asyncio.create_task(late_retry(bot, uid, pid))
+
+
+async def late_retry(bot: Bot, uid: int, pid: str):
+    """Panel dagitim sirasinda cevap vermediyse LATE_RETRY_MIN dakikada bir tekrar dener,
+    basarirsa o panelin linklerini kanallara gonderir."""
+    key = (uid, pid)
+    L, url = DEFAULT_LANG, ""
+    try:
+        for _ in range(LATE_RETRIES):
+            await asyncio.sleep(LATE_RETRY_MIN * 60)
+            o = await get_owner(uid)
+            L = o.get("lang", DEFAULT_LANG)
+            panel = next((p for p in o["panels"] if p["id"] == pid), None)
+            if not panel:
+                return
+            url = escape(panel["url"])
+            try:
+                res = await rotate_with_retry(uid, panel, attempts=2)
+                subs, links = pick_items(res, o.get("share_mode", DEFAULT_SHARE_MODE))
+                links = rename_links(links, o.get("link_name"), res.get("user", ""))
+            except PanelError as e:
+                if e.transient:
+                    continue
+                await bot.send_message(uid, f"❌ {url}: {e.text(L)}")
+                return
+            except Exception as e:
+                log.warning("late_retry hata: %s", e)
+                continue
+            channels = [c async for c in db.channels.find({"owner_id": uid})]
+            msgs = build_messages(
+                [subs, links], o.get("footer", ""), o.get("expandable", True),
+                o.get("footer_media"), o.get("media_text", ""),
+            )
+            ok, fail = await send_to_channels(bot, channels, msgs)
+            text = t(L, "late_ok", url=url, ok=ok, total=len(channels))
+            if fail:
+                text += "\n\n" + t(L, "errs_title") + "\n" + "\n".join(fail)
+            await bot.send_message(uid, text)
+            return
+        await bot.send_message(uid, t(L, "late_fail", url=url))
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.error("late_retry coktu: %s", e)
+    finally:
+        if late_tasks.get(key) is asyncio.current_task():
+            late_tasks.pop(key, None)
+
+
+async def distribute(bot: Bot, uid: int, notify: bool = True):
+    o = await get_owner(uid)
+    L = o.get("lang", DEFAULT_LANG)
+    mode = o.get("share_mode", DEFAULT_SHARE_MODE)
+    if not o["panels"]:
+        if notify:
+            await bot.send_message(uid, t(L, "no_panel"))
+        return
+    channels = [c async for c in db.channels.find({"owner_id": uid})]
+    if not channels:
+        if notify:
+            await bot.send_message(uid, t(L, "no_channels"))
+        return
+
+    all_links, all_subs, errs, retry_ids = [], [], [], []
+    for p in o["panels"]:
+        cancel_late(uid, p["id"])  # bu panel icin bekleyen eski tekrar denemeyi iptal et
+        try:
+            res = await rotate_with_retry(uid, p)
+            subs, links = pick_items(res, mode)
+            links = rename_links(links, o.get("link_name"), res.get("user", ""))
+            all_subs += subs
+            all_links += links
+        except PanelError as e:
+            errs.append(f"{escape(p['url'])}: {e.text(L)}")
+            if e.transient:
+                retry_ids.append(p["id"])
+        except Exception as e:
+            errs.append(f"{escape(p['url'])}: {escape(str(e))}")
+
+    retry_note = ""
+    if retry_ids:
+        for pid in retry_ids:
+            start_late(bot, uid, pid)
+        retry_note = t(L, "retry_info", min=LATE_RETRY_MIN, n=LATE_RETRIES)
+
+    if not all_links and not all_subs:
+        await bot.send_message(uid, "❌ " + "\n".join(errs) + (f"\n\n{retry_note}" if retry_note else ""))
+        return
+
+    msgs = build_messages(
+        [all_subs, all_links], o.get("footer", ""), o.get("expandable", True),
+        o.get("footer_media"), o.get("media_text", ""),
+    )
+    ok, fail = await send_to_channels(bot, channels, msgs)
+
+    text = t(L, "sent", ok=ok, total=len(channels))
+    if errs or fail:
+        text += "\n\n" + t(L, "errs_title") + "\n" + "\n".join(errs + fail)
+    if retry_note:
+        text += "\n\n" + retry_note
+    await bot.send_message(uid, text)
+
+
+# --------------------------- Zamanlayici -------------------------
+async def scheduler(bot: Bot):
+    while True:
+        try:
+            now = datetime.now(ZoneInfo(TIMEZONE))
+            hm, today = now.strftime("%H:%M"), now.strftime("%Y-%m-%d")
+            q = {"times.0": {"$exists": True}, "panels.0": {"$exists": True}}
+            async for o in db.owners.find(q):
+                done = o.get("done") or {}
+                done_times = set(done.get("times", [])) if done.get("date") == today else set()
+                due = [x for x in o["times"] if x <= hm and x not in done_times]
+                if not due:
+                    continue
+                # vakti gelen (ve kacirilan) tum saatleri islenmis say, tek sefer gonder
+                await db.owners.update_one(
+                    {"_id": o["_id"]},
+                    {"$set": {"done": {"date": today, "times": sorted(done_times | set(due))}}},
+                )
+                asyncio.create_task(distribute(bot, o["_id"], notify=False))
+        except Exception as e:
+            log.error("scheduler hata: %s", e)
+        await asyncio.sleep(20)
+
+
+# ------------------------------ UI -------------------------------
+def B(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+async def main_kb(uid: int) -> InlineKeyboardMarkup:
+    o = await get_owner(uid)
+    L = o.get("lang", DEFAULT_LANG)
+    exp = o.get("expandable", True)
+    mode = o.get("share_mode", DEFAULT_SHARE_MODE)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [B(t(L, "b_addp"), "addp"), B(t(L, "b_delp"), "delp")],
+            [B(t(L, "b_send"), "send")],
+            [B(t(L, "b_time"), "time"), B(t(L, "b_footer"), "footer")],
+            [
+                B(t(L, "b_media_on" if o.get("footer_media") else "b_media"), "media"),
+                B(t(L, "b_lname_on" if o.get("link_name") else "b_lname"), "lname"),
+            ],
+            [B(t(L, "b_addch"), "addch"), B(t(L, "b_chs"), "channels")],
+            [B(t(L, "b_quote_on" if exp else "b_quote_off"), "quote"), B(t(L, "b_lang"), "lang")],
+            [B(t(L, "b_mode", m=t(L, f"mode_{mode}")), "mode")],
+        ]
+    )
+
+
+class PanelForm(StatesGroup):
+    url = State()
+    username = State()
+    password = State()
+
+
+class TimeForm(StatesGroup):
+    time = State()
+
+
+class ChannelForm(StatesGroup):
+    chat = State()
+
+
+class FooterForm(StatesGroup):
+    text = State()
+
+
+class MediaForm(StatesGroup):
+    media = State()
+
+
+class LinkNameForm(StatesGroup):
+    name = State()
+
+
+async def show_menu(target: Message, uid: int):
+    L = await get_lang(uid)
+    await target.answer(t(L, "menu_title"), reply_markup=await main_kb(uid))
+
+
+@router.message(CommandStart())
+@router.message(Command("menu"))
+async def start(m: Message, state: FSMContext):
+    await state.clear()
+    await db.owners.update_one({"_id": m.from_user.id}, {"$setOnInsert": {"expandable": True}}, upsert=True)
+    await show_menu(m, m.from_user.id)
+
+
+# --------------- Bot kanala admin yapildiginda ------------------
+@router.my_chat_member()
+async def on_admin_change(event: ChatMemberUpdated, bot: Bot):
+    if event.chat.type != "channel":
+        return
+    status = event.new_chat_member.status
+    if status == "administrator":
+        who = event.from_user.id
+        await db.channels.update_one(
+            {"_id": event.chat.id},
+            {"$set": {"title": event.chat.title, "owner_id": who}},
+            upsert=True,
+        )
+        L = await get_lang(who)
+        try:
+            await bot.send_message(
+                who,
+                t(L, "admin_done", title=escape(event.chat.title or "")),
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[B(t(L, "b_connect"), "addp")]]),
+            )
+        except Exception as e:
+            log.warning("Sahibe mesaj gonderilemedi (once /start yazmali): %s", e)
+    elif status in ("left", "kicked"):
+        await db.channels.delete_one({"_id": event.chat.id})
+
+
+# ------------------------ Panel ekle -----------------------------
+def norm_panel_url(raw: str) -> str:
+    """https://host:2053/xsteam/ -> https://host:2053/xsteam  (ozel yol oneki KORUNUR).
+    Sadece /dashboard, /dashboard/login, /api, /docs gibi panel arayuz yollari atilir."""
+    raw = raw.strip()
+    if not raw.startswith("http"):
+        raw = "http://" + raw
+    u = urlparse(raw)
+    path = re.sub(r"/(dashboard|api|docs|redoc)(/.*)?$", "", u.path.rstrip("/"), flags=re.I)
+    return f"{u.scheme}://{u.netloc}{path}"
+
+
+@router.callback_query(F.data == "addp")
+async def panel_start(c: CallbackQuery, state: FSMContext):
+    L = await get_lang(c.from_user.id)
+    await state.set_state(PanelForm.url)
+    await c.message.answer(t(L, "ask_url"))
+    await c.answer()
+
+
+@router.message(PanelForm.url)
+async def panel_url(m: Message, state: FSMContext):
+    L = await get_lang(m.from_user.id)
+    url = (m.text or "").strip()
+    if not url.startswith("http"):
+        url = "http://" + url
+    url = norm_panel_url(url)
+    await state.update_data(url=url)
+    await state.set_state(PanelForm.username)
+    await m.answer(t(L, "panel_addr", url=escape(url)))
+
+
+@router.message(PanelForm.username)
+async def panel_user(m: Message, state: FSMContext):
+    L = await get_lang(m.from_user.id)
+    await state.update_data(username=(m.text or "").strip())
+    await state.set_state(PanelForm.password)
+    await m.answer(t(L, "ask_pass"))
+
+
+@router.message(PanelForm.password)
+async def panel_pass(m: Message, state: FSMContext):
+    uid = m.from_user.id
+    L = await get_lang(uid)
+    data = await state.get_data()
+    panel = {
+        "id": new_id(),
+        "url": data["url"],
+        "username": data["username"],
+        "password": (m.text or "").strip(),
+        "current_user": None,
+    }
+    try:
+        await m.delete()  # parola mesajini sil
+    except Exception:
+        pass
+    await state.clear()
+    # /xsteam gibi yol bazen sadece arayuz yolu olur, API kokten calisir -> ikisini de dene
+    u = urlparse(panel["url"])
+    cands = [panel["url"]] + ([f"{u.scheme}://{u.netloc}"] if u.path else [])
+    first_err = None
+    for cand in cands:
+        panel["url"] = cand
+        try:
+            await panel_login(panel)
+            first_err = None
+            break
+        except PanelError as e:
+            first_err = first_err or e
+    if first_err:
+        panel["url"] = cands[0]
+        await m.answer(t(L, "fail_panel", err=first_err.text(L)), reply_markup=await main_kb(uid))
+        return
+    # ayni url+kullanici varsa degistir
+    await db.owners.update_one(
+        {"_id": uid}, {"$pull": {"panels": {"url": panel["url"], "username": panel["username"]}}}
+    )
+    await db.owners.update_one({"_id": uid}, {"$push": {"panels": panel}}, upsert=True)
+    await m.answer(t(L, "ok_panel"), reply_markup=await main_kb(uid))
+
+
+# ------------------------ Panel sil ------------------------------
+@router.callback_query(F.data == "delp")
+async def panel_del_list(c: CallbackQuery):
+    o = await get_owner(c.from_user.id)
+    L = o.get("lang", DEFAULT_LANG)
+    if not o["panels"]:
+        await c.message.answer(t(L, "del_none"))
+    else:
+        rows = [[B(f"🗑 {p['url']} ({p['username']})", f"delp:{p['id']}")] for p in o["panels"]]
+        await c.message.answer(t(L, "del_which"), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("delp:"))
+async def panel_del(c: CallbackQuery):
+    uid = c.from_user.id
+    pid = c.data.split(":", 1)[1]
+    o = await get_owner(uid)
+    L = o.get("lang", DEFAULT_LANG)
+    panel = next((p for p in o["panels"] if p["id"] == pid), None)
+    if not panel:
+        await c.answer()
+        return
+    if panel.get("current_user"):  # panelde acik kalan user'i da temizle
+        try:
+            token = await panel_login(panel)
+            await api(panel, "DELETE", f"/api/user/{panel['current_user']}", token)
+        except Exception:
+            pass
+    await db.owners.update_one({"_id": uid}, {"$pull": {"panels": {"id": pid}}})
+    await c.message.edit_text(t(L, "del_done", url=escape(panel["url"])))
+    await c.answer()
+
+
+# ------------------------- VPN dagit -----------------------------
+@router.callback_query(F.data == "send")
+async def send_now(c: CallbackQuery, bot: Bot):
+    await c.answer("...")
+    await distribute(bot, c.from_user.id)
+
+
+# ------------------------- Saat ayari ----------------------------
+@router.callback_query(F.data == "time")
+async def time_start(c: CallbackQuery, state: FSMContext):
+    o = await get_owner(c.from_user.id)
+    L = o.get("lang", DEFAULT_LANG)
+    await state.set_state(TimeForm.time)
+    await c.message.answer(t(L, "time_cur", cur=", ".join(o.get("times") or []) or t(L, "not_set"), tz=TIMEZONE))
+    await c.answer()
+
+
+@router.message(TimeForm.time)
+async def time_set(m: Message, state: FSMContext):
+    uid = m.from_user.id
+    L = await get_lang(uid)
+    txt = (m.text or "").strip().lower()
+    if txt in ("kapat", "ýap", "yap", "off"):
+        await db.owners.update_one({"_id": uid}, {"$unset": {"times": "", "done": "", "time": ""}})
+        await state.clear()
+        await m.answer(t(L, "time_off"), reply_markup=await main_kb(uid))
+        return
+    times = []
+    for part in [x for x in re.split(r"[,;\s]+", txt) if x]:
+        mt = re.fullmatch(r"(\d{1,2})[:.](\d{2})", part)
+        if not mt or int(mt.group(1)) > 23 or int(mt.group(2)) > 59:
+            await m.answer(t(L, "time_bad"))
+            return
+        times.append(f"{int(mt.group(1)):02d}:{mt.group(2)}")  # 6:00 -> 06:00
+    times = sorted(set(times))
+    if not times or len(times) > MAX_TIMES:
+        await m.answer(t(L, "time_bad"))
+        return
+    now = datetime.now(ZoneInfo(TIMEZONE))
+    past = [x for x in times if x <= now.strftime("%H:%M")]  # bugun gecmis saatler hemen calismasin
+    await db.owners.update_one(
+        {"_id": uid},
+        {"$set": {"times": times, "done": {"date": now.strftime("%Y-%m-%d"), "times": past}}, "$unset": {"time": ""}},
+        upsert=True,
+    )
+    await state.clear()
+    await m.answer(t(L, "time_set", t=", ".join(times)), reply_markup=await main_kb(uid))
+
+
+# ------------------------ Post metni (footer) --------------------
+@router.callback_query(F.data == "footer")
+async def footer_start(c: CallbackQuery, state: FSMContext):
+    o = await get_owner(c.from_user.id)
+    L = o.get("lang", DEFAULT_LANG)
+    await state.set_state(FooterForm.text)
+    text = t(L, "footer_ask")
+    if o.get("footer"):
+        text += t(L, "footer_cur", cur=o["footer"])
+    await c.message.answer(text, link_preview_options=NO_PREVIEW)
+    await c.answer()
+
+
+@router.message(FooterForm.text)
+async def footer_set(m: Message, state: FSMContext, bot: Bot):
+    uid = m.from_user.id
+    L = await get_lang(uid)
+    if not m.text:
+        await m.answer(t(L, "footer_text_only"))
+        return
+    if m.text.strip().lower() in ("sil", "poz", "clear"):
+        await db.owners.update_one({"_id": uid}, {"$unset": {"footer": ""}})
+        await state.clear()
+        await m.answer(t(L, "footer_cleared"), reply_markup=await main_kb(uid))
+        return
+    html = m.html_text  # Telegram'daki biçimlendirme (kalin, italik, link...) HTML olarak korunur
+    if len(html) > FOOTER_MAX:
+        await m.answer(t(L, "footer_long", n=FOOTER_MAX))
+        return
+    try:
+        await bot.send_message(uid, html, link_preview_options=NO_PREVIEW)  # onizleme + dogrulama
+    except TelegramBadRequest as e:
+        await m.answer(t(L, "footer_bad", err=escape(str(e))))
+        return
+    await db.owners.update_one({"_id": uid}, {"$set": {"footer": html}}, upsert=True)
+    await state.clear()
+    await m.answer(t(L, "footer_saved"), reply_markup=await main_kb(uid))
+
+
+# ------------------------ VPN link adi ---------------------------
+@router.callback_query(F.data == "lname")
+async def lname_start(c: CallbackQuery, state: FSMContext):
+    o = await get_owner(c.from_user.id)
+    L = o.get("lang", DEFAULT_LANG)
+    await state.set_state(LinkNameForm.name)
+    text = t(L, "lname_ask")
+    if o.get("link_name"):
+        text += t(L, "lname_cur", cur=escape(o["link_name"]))
+    await c.message.answer(text)
+    await c.answer()
+
+
+@router.message(LinkNameForm.name)
+async def lname_set(m: Message, state: FSMContext):
+    uid = m.from_user.id
+    L = await get_lang(uid)
+    if not m.text:
+        await m.answer(t(L, "lname_only"))
+        return
+    name = " ".join(m.text.split())  # satir sonlarini / fazla bosluklari temizle
+    if name.lower() in ("sil", "poz", "clear"):
+        await db.owners.update_one({"_id": uid}, {"$unset": {"link_name": ""}})
+        await state.clear()
+        await m.answer(t(L, "lname_cleared"), reply_markup=await main_kb(uid))
+        return
+    if len(name) > LINK_NAME_MAX:
+        await m.answer(t(L, "lname_long", n=LINK_NAME_MAX))
+        return
+    await db.owners.update_one({"_id": uid}, {"$set": {"link_name": name}}, upsert=True)
+    await state.clear()
+    await m.answer(t(L, "lname_saved", cur=escape(name)), reply_markup=await main_kb(uid))
+
+
+# ------------------------ Foto / medya ---------------------------
+@router.callback_query(F.data == "media")
+async def media_start(c: CallbackQuery, state: FSMContext):
+    o = await get_owner(c.from_user.id)
+    L = o.get("lang", DEFAULT_LANG)
+    await state.set_state(MediaForm.media)
+    text = t(L, "media_ask")
+    if o.get("footer_media"):
+        text += t(L, "media_cur", kind=t(L, "m_" + o["footer_media"]["type"]))
+        if o.get("media_text"):
+            text += t(L, "media_cur_text", cur=o["media_text"])
+    await c.message.answer(text, link_preview_options=NO_PREVIEW)
+    await c.answer()
+
+
+@router.message(MediaForm.media)
+async def media_set(m: Message, state: FSMContext, bot: Bot):
+    uid = m.from_user.id
+    L = await get_lang(uid)
+    media = extract_media(m)
+    if not media:
+        if m.text and m.text.strip().lower() in ("sil", "poz", "clear"):
+            await db.owners.update_one({"_id": uid}, {"$unset": {"footer_media": "", "media_text": ""}})
+            await state.clear()
+            await m.answer(t(L, "media_cleared"), reply_markup=await main_kb(uid))
+        else:
+            await m.answer(t(L, "media_only"))
+        return
+    # caption yoksa html_text hata verir -> bos birak (foto yazisi istege bagli)
+    html = m.html_text if (m.text or m.caption) else ""
+    if vlen(html) > MEDIA_TEXT_MAX:
+        await m.answer(t(L, "footer_long", n=MEDIA_TEXT_MAX))
+        return
+    try:
+        await safe_send(bot, uid, {**media, "caption": html})  # onizleme + dogrulama
+    except TelegramBadRequest as e:
+        await m.answer(t(L, "footer_bad", err=escape(str(e))))
+        return
+    await db.owners.update_one({"_id": uid}, {"$set": {"footer_media": media, "media_text": html}}, upsert=True)
+    await state.clear()
+    await m.answer(t(L, "media_saved"), reply_markup=await main_kb(uid))
+
+
+# --------------------- Alinti acik/kapali ------------------------
+@router.callback_query(F.data == "quote")
+async def quote_toggle(c: CallbackQuery):
+    uid = c.from_user.id
+    o = await get_owner(uid)
+    L = o.get("lang", DEFAULT_LANG)
+    new = not o.get("expandable", True)
+    await db.owners.update_one({"_id": uid}, {"$set": {"expandable": new}}, upsert=True)
+    await c.message.edit_reply_markup(reply_markup=await main_kb(uid))
+    await c.answer(t(L, "quote_on_msg" if new else "quote_off_msg"), show_alert=False)
+
+
+# ------------------- Paylasim turu (config / sub) ----------------
+SHARE_MODES = ["links", "sub", "both"]
+
+
+@router.callback_query(F.data == "mode")
+async def mode_toggle(c: CallbackQuery):
+    uid = c.from_user.id
+    o = await get_owner(uid)
+    L = o.get("lang", DEFAULT_LANG)
+    cur = o.get("share_mode", DEFAULT_SHARE_MODE)
+    new = SHARE_MODES[(SHARE_MODES.index(cur) + 1) % len(SHARE_MODES)] if cur in SHARE_MODES else DEFAULT_SHARE_MODE
+    await db.owners.update_one({"_id": uid}, {"$set": {"share_mode": new}}, upsert=True)
+    await c.message.edit_reply_markup(reply_markup=await main_kb(uid))
+    await c.answer(t(L, "mode_msg", m=t(L, f"mode_{new}")), show_alert=False)
+
+
+# ----------------------------- Dil -------------------------------
+@router.callback_query(F.data == "lang")
+async def lang_pick(c: CallbackQuery):
+    L = await get_lang(c.from_user.id)
+    rows = [[B(name, f"setlang:{code}")] for code, name in LANGS.items()]
+    await c.message.answer(t(L, "lang_pick"), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("setlang:"))
+async def lang_set(c: CallbackQuery):
+    uid = c.from_user.id
+    code = c.data.split(":", 1)[1]
+    if code not in LANGS:
+        await c.answer()
+        return
+    await db.owners.update_one({"_id": uid}, {"$set": {"lang": code}}, upsert=True)
+    await c.message.edit_text(t(code, "lang_set"))
+    await show_menu(c.message, uid)
+    await c.answer()
+
+
+# ------------------------ Kanal ekle / liste ---------------------
+@router.callback_query(F.data == "addch")
+async def addch_start(c: CallbackQuery, state: FSMContext):
+    L = await get_lang(c.from_user.id)
+    await state.set_state(ChannelForm.chat)
+    await c.message.answer(t(L, "ask_chat"))
+    await c.answer()
+
+
+@router.message(ChannelForm.chat)
+async def addch_do(m: Message, state: FSMContext, bot: Bot):
+    uid = m.from_user.id
+    L = await get_lang(uid)
+    ref = (m.text or "").strip()
+    if ref.lstrip("-").isdigit():
+        ref = int(ref)
+    try:
+        chat = await bot.get_chat(ref)
+        me = await bot.get_chat_member(chat.id, bot.id)
+        if me.status != "administrator":
+            raise ValueError(t(L, "bot_not_admin"))
+        you = await bot.get_chat_member(chat.id, uid)
+        if you.status not in ("creator", "administrator"):
+            raise ValueError(t(L, "you_not_admin"))
+    except Exception as e:
+        await m.answer(f"❌ {escape(str(e))}")
+        return
+    await db.channels.update_one(
+        {"_id": chat.id}, {"$set": {"title": chat.title, "owner_id": uid}}, upsert=True
+    )
+    await state.clear()
+    await m.answer(t(L, "ch_added", title=escape(chat.title or "")), reply_markup=await main_kb(uid))
+
+
+@router.callback_query(F.data == "channels")
+async def list_channels(c: CallbackQuery):
+    L = await get_lang(c.from_user.id)
+    items = [x async for x in db.channels.find({"owner_id": c.from_user.id})]
+    if not items:
+        await c.message.answer(t(L, "ch_none"))
+    else:
+        await c.message.answer(
+            t(L, "ch_list") + "\n" + "\n".join(f"• {escape(x.get('title') or str(x['_id']))}" for x in items)
+        )
+    await c.answer()
+
+
+# ------------------------------ main -----------------------------
+async def migrate_old_panels():
+    async for o in db.owners.find({"$or": [{"panel": {"$exists": True}}, {"time": {"$exists": True}}]}):
+        await get_owner(o["_id"])
+
+
+async def main():
+    threading.Thread(target=run_flask, daemon=True).start()
+    await migrate_old_panels()
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+    asyncio.create_task(scheduler(bot))
+    asyncio.create_task(keep_alive())
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
